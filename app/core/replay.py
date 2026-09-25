@@ -41,6 +41,10 @@ class Event:
     student_id: str
     payload: dict[str, Any]
     created_at: datetime
+    # Server-persisted monotonic position within the plan; authoritative for
+    # replay ordering. It is only None for events built directly in-process
+    # (e.g. legacy unit tests), in which case replay falls back to event_id.
+    seq: int | None = None
 
 
 @dataclass
@@ -126,15 +130,28 @@ def replay(
     plan_version: str,
     timezone_name: str,
     required_seconds: int,
-    up_to_event_id: str | None = None,
+    up_to_seq: int | None = None,
 ) -> ReplayState:
-    """执行确定性的业务处理。"""
+    """执行确定性的业务处理。
+
+    Events are applied in server-assigned ``seq`` order, never by the
+    business ``event_id`` (whose format varies across upstream systems).
+    ``up_to_seq`` reconstructs a past cutoff; events carrying no seq are
+    in-process fixtures and fall back to ``event_id`` ordering.
+    """
+    plan_events = [e for e in events if e.plan_version == plan_version]
     sorted_events = sorted(
-        (e for e in events if e.plan_version == plan_version),
-        key=lambda e: e.event_id,
+        plan_events,
+        key=lambda e: (
+            e.seq is None,
+            e.seq if e.seq is not None else 0,
+            e.event_id,
+        ),
     )
-    if up_to_event_id is not None:
-        sorted_events = [e for e in sorted_events if e.event_id <= up_to_event_id]
+    if up_to_seq is not None:
+        sorted_events = [
+            e for e in sorted_events if e.seq is not None and e.seq <= up_to_seq
+        ]
 
     checkins_by_student: dict[str, list[CheckinRecord]] = {}
     checkin_index: dict[str, CheckinRecord] = {}

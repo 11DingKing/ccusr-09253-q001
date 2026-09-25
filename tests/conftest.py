@@ -1,6 +1,13 @@
 """服务端业务模块。"""
 from __future__ import annotations
+
+import os
 from collections.abc import Iterator
+
+# Pin the database before app modules import the engine so the lifespan
+# migration runs against the test file, never the default local database.
+os.environ.setdefault("DATABASE_URL", "sqlite:///./practice_hours_test.db")
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine

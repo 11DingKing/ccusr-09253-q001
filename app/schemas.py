@@ -121,6 +121,7 @@ class SnapshotOut(BaseModel):
     required_seconds: int
     generated_at: str
     event_cutoff_id: str | None
+    event_cutoff_seq: int | None = None
     students: list[dict[str, Any]]
 
 
@@ -136,5 +137,7 @@ class DiffOut(BaseModel):
     new_generated_at: str
     old_event_cutoff_id: str | None
     new_event_cutoff_id: str | None
+    old_event_cutoff_seq: int | None = None
+    new_event_cutoff_seq: int | None = None
     student_changes: list[dict[str, Any]]
     students_affected: int

@@ -25,6 +25,9 @@ class Snapshot:
     generated_at: str
     event_cutoff_id: str | None
     students: list[dict[str, Any]]
+    # Numeric server-side cutoff position. Stored alongside the legacy
+    # event_cutoff_id so historical snapshots keep reproducing exactly.
+    event_cutoff_seq: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -34,6 +37,7 @@ class Snapshot:
             "required_seconds": self.required_seconds,
             "generated_at": self.generated_at,
             "event_cutoff_id": self.event_cutoff_id,
+            "event_cutoff_seq": self.event_cutoff_seq,
             "students": self.students,
         }
 
@@ -47,6 +51,7 @@ class Snapshot:
             generated_at=data["generated_at"],
             event_cutoff_id=data.get("event_cutoff_id"),
             students=list(data.get("students", [])),
+            event_cutoff_seq=data.get("event_cutoff_seq"),
         )
 
 
@@ -83,16 +88,33 @@ def build_snapshot(
     timezone_name: str,
     required_seconds: int,
     freeze_id: str | None = None,
-    event_cutoff_id: str | None = None,
+    event_cutoff_seq: int | None = None,
     generated_at: datetime | None = None,
 ) -> Snapshot:
-    """执行确定性的业务处理。"""
+    """执行确定性的业务处理。
+
+    The cutoff is expressed in server-assigned seq order. The display
+    event_cutoff_id is derived from whichever event actually occupies that
+    position, so it is correct even when business IDs are not ordered.
+    """
+    plan_events = [e for e in events if e.plan_version == plan_version]
+    cutoff_seq = event_cutoff_seq
+    if cutoff_seq is None:
+        cutoff_id = None
+    else:
+        within = [
+            e
+            for e in plan_events
+            if e.seq is not None and e.seq <= cutoff_seq
+        ]
+        cutoff_id = max(within, key=lambda e: e.seq).event_id if within else None
+
     state: ReplayState = replay(
-        events,
+        plan_events,
         plan_version=plan_version,
         timezone_name=timezone_name,
         required_seconds=required_seconds,
-        up_to_event_id=event_cutoff_id,
+        up_to_seq=cutoff_seq,
     )
     if generated_at is None:
         generated_at = datetime.now(timezone.utc)
@@ -109,7 +131,8 @@ def build_snapshot(
         timezone=timezone_name,
         required_seconds=required_seconds,
         generated_at=generated_at.isoformat().replace("+00:00", "Z"),
-        event_cutoff_id=event_cutoff_id,
+        event_cutoff_id=cutoff_id,
+        event_cutoff_seq=cutoff_seq,
         students=students,
     )
 
@@ -191,6 +214,8 @@ def diff_snapshots(old: Snapshot, new: Snapshot) -> dict[str, Any]:
         "new_generated_at": new.generated_at,
         "old_event_cutoff_id": old.event_cutoff_id,
         "new_event_cutoff_id": new.event_cutoff_id,
+        "old_event_cutoff_seq": old.event_cutoff_seq,
+        "new_event_cutoff_seq": new.event_cutoff_seq,
         "student_changes": student_changes,
         "students_affected": len(student_changes),
     }

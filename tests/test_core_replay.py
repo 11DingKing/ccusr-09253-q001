@@ -21,6 +21,7 @@ def _event(
     student_id: str,
     payload: dict,
     plan_version: str = "P1",
+    seq: int | None = None,
 ) -> Event:
     return Event(
         event_id=event_id,
@@ -29,6 +30,7 @@ def _event(
         student_id=student_id,
         payload=payload,
         created_at=datetime.now(timezone.utc),
+        seq=seq,
     )
 
 
@@ -41,6 +43,7 @@ def _checkin(
     activity_type: str = "regular",
     activity_id: str = "A1",
     plan_version: str = "P1",
+    seq: int | None = None,
 ) -> Event:
     return _event(
         eid,
@@ -53,6 +56,7 @@ def _checkin(
             "check_out_at": end,
         },
         plan_version=plan_version,
+        seq=seq,
     )
 
 
@@ -199,11 +203,11 @@ def test_replay_only_considers_requested_plan():
     assert state.students["S1"].confirmed_seconds == 7200
 
 
-def test_replay_up_to_event_id_reconstructs_past_state():
+def test_replay_up_to_seq_reconstructs_past_state():
     events = [
-        _checkin("E-01", "S1", "2024-03-15T08:00:00+08:00", "2024-03-15T09:00:00+08:00"),
-        _checkin("E-02", "S1", "2024-03-15T09:00:00+08:00", "2024-03-15T10:00:00+08:00"),
-        _checkin("E-03", "S1", "2024-03-15T10:00:00+08:00", "2024-03-15T11:00:00+08:00"),
+        _checkin("E-01", "S1", "2024-03-15T08:00:00+08:00", "2024-03-15T09:00:00+08:00", seq=1),
+        _checkin("E-02", "S1", "2024-03-15T09:00:00+08:00", "2024-03-15T10:00:00+08:00", seq=2),
+        _checkin("E-03", "S1", "2024-03-15T10:00:00+08:00", "2024-03-15T11:00:00+08:00", seq=3),
     ]
     full = replay(
         events, plan_version="P1", timezone_name="Asia/Shanghai", required_seconds=0
@@ -215,9 +219,50 @@ def test_replay_up_to_event_id_reconstructs_past_state():
         plan_version="P1",
         timezone_name="Asia/Shanghai",
         required_seconds=0,
-        up_to_event_id="E-02",
+        up_to_seq=2,
     )
     assert past.students["S1"].confirmed_seconds == 2 * 3600
+
+
+def test_replay_orders_by_seq_regardless_of_event_id_format():
+    # Business IDs come from different systems: prefixed code, bare digits.
+    # "E-10" would sort before "E-2" lexicographically; a late backfill "1"
+    # sorts first as a string. Server seq must win in every case.
+    events = [
+        _event(
+            "E-10",
+            EventType.LEAVE_CORRECTION,
+            "S1",
+            {"adjustment_seconds": 600, "reason": "seq is earliest"},
+            seq=1,
+        ),
+        _checkin("1", "S1", "2024-03-15T08:00:00+08:00", "2024-03-15T09:00:00+08:00", seq=2),
+        _checkin("E-2", "S1", "2024-03-15T09:00:00+08:00", "2024-03-15T10:00:00+08:00", seq=3),
+    ]
+    # Mentor confirm depends on a checkin; the decisive property is the total
+    # derived from seq order: 2h checkin + 10min correction.
+    state = replay(
+        list(reversed(events)),
+        plan_version="P1",
+        timezone_name="Asia/Shanghai",
+        required_seconds=0,
+    )
+    progress = state.students["S1"]
+    assert progress.confirmed_seconds == 2 * 3600
+    assert progress.adjustment_seconds == 600
+    assert progress.total_seconds == 2 * 3600 + 600
+
+    # A cutoff at seq 2 must exclude the later-persisted "E-2" checkin even
+    # though its event_id sorts after neither of the others numerically.
+    past = replay(
+        events,
+        plan_version="P1",
+        timezone_name="Asia/Shanghai",
+        required_seconds=0,
+        up_to_seq=2,
+    )
+    assert past.students["S1"].confirmed_seconds == 3600
+    assert past.students["S1"].adjustment_seconds == 600
 
 
 def test_10000_event_replay_is_deterministic():
