@@ -1,24 +1,33 @@
-"""服务端业务模块。"""
+"""测试夹具。"""
 from __future__ import annotations
+
+import os
 from collections.abc import Iterator
+
+# 必须在导入任何 app.* 模块前指定测试库：app.db 在导入时按 DATABASE_URL 建引擎。
+os.environ.setdefault("DATABASE_URL", "sqlite:///./practice_hours_test.db")
+
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.db import get_db
+from app.db import get_db, make_sqlite_engine
 from app.main import app
+from app.migrations import run_migrations
 from app.models import Base
 
-test_engine = create_engine(
+test_engine = make_sqlite_engine(
     "sqlite:///./practice_hours_test.db",
-    connect_args={"check_same_thread": False, "timeout": 30},
+    check_same_thread=False,
 )
 TestSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, future=True)
 
 @pytest.fixture(autouse=True)
 def _schema() -> Iterator[None]:
+    # 与生产启动路径一致：先建表，再执行幂等迁移（重复执行必须安全）。
     Base.metadata.create_all(test_engine)
+    run_migrations(test_engine)
+    run_migrations(test_engine)
     yield
     Base.metadata.drop_all(test_engine)
 

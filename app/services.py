@@ -1,8 +1,7 @@
-"""服务端业务模块。"""
+"""应用服务层：事件导入、重放、截止查询与冻结签发。"""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -14,8 +13,7 @@ from .repository import (
     insert_events,
     insert_freeze,
     load_events,
-    load_events_up_to,
-    max_event_id,
+    get_cutoff,
     upsert_plan,
 )
 
@@ -70,6 +68,14 @@ def _require_plan(db: Session, plan_version: str):
     return plan
 
 
+def _snapshot_from_row(row) -> Snapshot:
+    """从持久化行还原快照；迁移产生的旧快照用列补齐截止序位。"""
+    snap = Snapshot.from_dict(row.snapshot)
+    if snap.event_cutoff_seq is None and row.event_cutoff_seq is not None:
+        snap.event_cutoff_seq = row.event_cutoff_seq
+    return snap
+
+
 def import_events(
     db: Session, *, plan_version: str, events: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -105,13 +111,20 @@ def student_progress(
 def freeze_semester(
     db: Session, *, plan_version: str, freeze_id: str
 ) -> tuple[Snapshot, bool]:
-    """执行确定性的业务处理。"""
+    """签发冻结。
+
+    整个方法在同一个写事务（BEGIN IMMEDIATE）内完成：首条语句即取得
+    库级写锁，因此截止序位读取、事件重放与冻结落库之间不可能插入并发
+    导入；重复冻结返回已签发快照，结果永不改变。
+    """
     plan = _require_plan(db, plan_version)
     existing = get_freeze(db, plan_version, freeze_id)
     if existing is not None:
-        return Snapshot.from_dict(existing.snapshot), False
+        db.rollback()  # 尽快释放写锁
+        return _snapshot_from_row(existing), False
 
-    cutoff = max_event_id(db, plan_version)
+    # 持锁后读取截止点与事件：迟到补录一旦在截止之后提交，序位必然更大。
+    cutoff_seq, cutoff_id = get_cutoff(db, plan_version)
     events = load_events(db, plan_version)
     snap = build_snapshot(
         events,
@@ -119,19 +132,21 @@ def freeze_semester(
         timezone_name=plan.iana_timezone,
         required_seconds=plan.required_seconds,
         freeze_id=freeze_id,
-        event_cutoff_id=cutoff,
+        event_cutoff_seq=cutoff_seq,
+        event_cutoff_id=cutoff_id,
     )
     row = insert_freeze(
         db,
         plan_version=plan_version,
         freeze_id=freeze_id,
         snapshot=snap.to_dict(),
-        event_cutoff_id=cutoff,
+        event_cutoff_id=cutoff_id,
+        event_cutoff_seq=cutoff_seq,
     )
     if row is None:
         existing = get_freeze(db, plan_version, freeze_id)
         assert existing is not None
-        return Snapshot.from_dict(existing.snapshot), False
+        return _snapshot_from_row(existing), False
     return snap, True
 
 
@@ -144,7 +159,7 @@ def get_frozen_snapshot(
         raise FreezeNotFoundError(
             f"freeze '{freeze_id}' for plan '{plan_version}' does not exist"
         )
-    return Snapshot.from_dict(row.snapshot)
+    return _snapshot_from_row(row)
 
 
 def explain_frozen_student(

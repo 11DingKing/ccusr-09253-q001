@@ -1,8 +1,11 @@
-"""服务端业务模块。"""
+"""事件与冻结的持久化访问。
+
+写操作依赖调用方会话已处于写事务（见 ``app.db`` 的 BEGIN IMMEDIATE），
+因此 ``seq`` 的"取当前最大值 + 1"分配不会与并发导入互相覆盖。
+"""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -53,6 +56,7 @@ def _to_core_event(row: EventModel) -> CoreEvent:
         student_id=row.student_id,
         payload=dict(row.payload),
         created_at=row.created_at,
+        seq=row.seq,
     )
 
 
@@ -62,11 +66,21 @@ def insert_events(
     plan_version: str,
     events: list[dict[str, Any]],
 ) -> tuple[list[str], list[str]]:
-    """执行确定性的业务处理。"""
+    """幂等导入；新事件按提交顺序获得本培养方案内单调递增的序位。"""
     accepted: list[str] = []
     duplicates: list[str] = []
+
+    next_seq = db.execute(
+        select(EventModel.seq)
+        .where(EventModel.plan_version == plan_version)
+        .order_by(EventModel.seq.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    next_seq = (next_seq or 0) + 1
+
     for e in events:
         stmt = sqlite_insert(EventModel).values(
+            seq=next_seq,
             event_id=e["event_id"],
             plan_version=plan_version,
             student_id=e["student_id"],
@@ -79,6 +93,7 @@ def insert_events(
         inserted_id = db.execute(stmt).scalar_one_or_none()
         if inserted_id is not None:
             accepted.append(e["event_id"])
+            next_seq += 1
         else:
             duplicates.append(e["event_id"])
     db.commit()
@@ -86,32 +101,41 @@ def insert_events(
 
 
 def load_events(db: Session, plan_version: str) -> list[CoreEvent]:
-    stmt = select(EventModel).where(EventModel.plan_version == plan_version)
-    rows = db.execute(stmt).scalars().all()
-    return [_to_core_event(r) for r in rows]
-
-
-def load_events_up_to(
-    db: Session, plan_version: str, max_event_id: str
-) -> list[CoreEvent]:
-    """执行确定性的业务处理。"""
+    """按服务端单调序位读取培养方案的全部事件（含迟到补录）。"""
     stmt = (
         select(EventModel)
         .where(EventModel.plan_version == plan_version)
-        .where(EventModel.event_id <= max_event_id)
+        .order_by(EventModel.seq.asc(), EventModel.id.asc())
     )
     rows = db.execute(stmt).scalars().all()
     return [_to_core_event(r) for r in rows]
 
 
-def max_event_id(db: Session, plan_version: str) -> str | None:
+def load_events_up_to_seq(
+    db: Session, plan_version: str, max_seq: int
+) -> list[CoreEvent]:
+    """读取截止序位及之前的事件——迟到补录的序位更大，不会渗入。"""
     stmt = (
-        select(EventModel.event_id)
+        select(EventModel)
         .where(EventModel.plan_version == plan_version)
-        .order_by(EventModel.event_id.desc())
-        .limit(1)
+        .where(EventModel.seq <= max_seq)
+        .order_by(EventModel.seq.asc(), EventModel.id.asc())
     )
-    return db.execute(stmt).scalar_one_or_none()
+    rows = db.execute(stmt).scalars().all()
+    return [_to_core_event(r) for r in rows]
+
+
+def get_cutoff(db: Session, plan_version: str) -> tuple[int | None, str | None]:
+    """返回当前最大持久化序位及其业务编号；无事件时为 (None, None)。"""
+    row = db.execute(
+        select(EventModel.seq, EventModel.event_id)
+        .where(EventModel.plan_version == plan_version)
+        .order_by(EventModel.seq.desc())
+        .limit(1)
+    ).first()
+    if row is None:
+        return None, None
+    return row[0], row[1]
 
 
 def get_freeze(
@@ -127,13 +151,15 @@ def insert_freeze(
     freeze_id: str,
     snapshot: dict[str, Any],
     event_cutoff_id: str | None,
+    event_cutoff_seq: int | None,
 ) -> Freeze | None:
-    """执行确定性的业务处理。"""
+    """幂等落库冻结；主键冲突时保留先签发的结果。"""
     stmt = sqlite_insert(Freeze).values(
         plan_version=plan_version,
         freeze_id=freeze_id,
         snapshot=snapshot,
         event_cutoff_id=event_cutoff_id,
+        event_cutoff_seq=event_cutoff_seq,
     )
     stmt = stmt.on_conflict_do_nothing(
         index_elements=["plan_version", "freeze_id"]

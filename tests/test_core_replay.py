@@ -110,8 +110,8 @@ def test_overlapping_regular_checkins_are_unioned():
 
 
 def test_out_of_order_correction_converges():
-    # A correction arriving before/after other events must not change the
-    # final total because replay sorts by event_id.
+    # 离线构造的事件没有服务端序位时退回编号排序；修正量与签到区间
+    # 均与顺序无关，因此正序、倒序重放结果一致。
     base = [
         _checkin("E-03", "S1", "2024-03-15T08:00:00+08:00", "2024-03-15T10:00:00+08:00"),
         _event(
@@ -199,12 +199,15 @@ def test_replay_only_considers_requested_plan():
     assert state.students["S1"].confirmed_seconds == 7200
 
 
-def test_replay_up_to_event_id_reconstructs_past_state():
+def test_replay_up_to_seq_reconstructs_past_state():
     events = [
         _checkin("E-01", "S1", "2024-03-15T08:00:00+08:00", "2024-03-15T09:00:00+08:00"),
         _checkin("E-02", "S1", "2024-03-15T09:00:00+08:00", "2024-03-15T10:00:00+08:00"),
         _checkin("E-03", "S1", "2024-03-15T10:00:00+08:00", "2024-03-15T11:00:00+08:00"),
     ]
+    # 服务端持久化序位：与业务编号格式无关。
+    for i, event in enumerate(events, start=1):
+        object.__setattr__(event, "seq", i)
     full = replay(
         events, plan_version="P1", timezone_name="Asia/Shanghai", required_seconds=0
     )
@@ -215,9 +218,62 @@ def test_replay_up_to_event_id_reconstructs_past_state():
         plan_version="P1",
         timezone_name="Asia/Shanghai",
         required_seconds=0,
-        up_to_event_id="E-02",
+        up_to_seq=2,
     )
     assert past.students["S1"].confirmed_seconds == 2 * 3600
+
+
+def test_replay_orders_by_server_seq_regardless_of_id_format():
+    # 字典序下 "E-10" < "E-2"，且 "ZZZ-1" 排最后；服务端序位才是真相。
+    checkin = _checkin(
+        "E-10",
+        "S1",
+        "2024-03-15T08:00:00+08:00",
+        "2024-03-15T12:00:00+08:00",
+        activity_type="internship",
+    )
+    correction = _event(
+        "1",
+        EventType.LEAVE_CORRECTION,
+        "S1",
+        {"adjustment_seconds": 900, "reason": "make-up"},
+    )
+    confirm = _event(
+        "ZZZ-1",
+        EventType.MENTOR_CONFIRM,
+        "S1",
+        {"checkin_event_id": "E-10"},
+    )
+    for event, seq in ((checkin, 1), (correction, 2), (confirm, 3)):
+        object.__setattr__(event, "seq", seq)
+
+    state = replay(
+        [confirm, correction, checkin],
+        plan_version="P1",
+        timezone_name="Asia/Shanghai",
+        required_seconds=3600,
+    )
+    progress = state.students["S1"]
+    # 实习签到被序位 3 的确认转为 confirmed，序位 2 的修正累加。
+    assert progress.confirmed_seconds == 4 * 3600
+    assert progress.pending_seconds == 0
+    assert progress.adjustment_seconds == 900
+    assert progress.total_seconds == 4 * 3600 + 900
+    # 明细顺序也按序位，而不是编号字典序。
+    assert [a.event_id for a in progress.adjustments] == ["1"]
+
+    # 截止到序位 2：确认尚未发生，签到仍是 pending。
+    past = replay(
+        [checkin, correction, confirm],
+        plan_version="P1",
+        timezone_name="Asia/Shanghai",
+        required_seconds=3600,
+        up_to_seq=2,
+    )
+    past_progress = past.students["S1"]
+    assert past_progress.pending_seconds == 4 * 3600
+    assert past_progress.confirmed_seconds == 0
+    assert past_progress.total_seconds == 900
 
 
 def test_10000_event_replay_is_deterministic():

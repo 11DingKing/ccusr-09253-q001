@@ -41,6 +41,8 @@ class Event:
     student_id: str
     payload: dict[str, Any]
     created_at: datetime
+    # 服务端持久化的单调序位；事件顺序只由它决定，与 event_id 的格式无关。
+    seq: int | None = None
 
 
 @dataclass
@@ -52,6 +54,7 @@ class CheckinRecord:
     start_utc: datetime
     end_utc: datetime
     status: CheckinStatus
+    seq: int | None = None
 
     @property
     def seconds(self) -> int:
@@ -68,6 +71,7 @@ class Adjustment:
     student_id: str
     seconds: int
     reason: str
+    seq: int | None = None
 
 
 @dataclass
@@ -117,7 +121,15 @@ def _parse_checkin(
         start_utc=start,
         end_utc=end,
         status=status,
+        seq=event.seq,
     )
+
+
+def _order_key(event: Event) -> tuple[bool, int, str]:
+    """服务端序位优先；未持久化序位时退回编号字典序（仅离线构造场景）。"""
+    if event.seq is not None:
+        return (False, event.seq, "")
+    return (True, 0, event.event_id)
 
 
 def replay(
@@ -126,15 +138,17 @@ def replay(
     plan_version: str,
     timezone_name: str,
     required_seconds: int,
-    up_to_event_id: str | None = None,
+    up_to_seq: int | None = None,
 ) -> ReplayState:
-    """执行确定性的业务处理。"""
+    """按服务端持久化的单调序位重放事件。"""
     sorted_events = sorted(
         (e for e in events if e.plan_version == plan_version),
-        key=lambda e: e.event_id,
+        key=_order_key,
     )
-    if up_to_event_id is not None:
-        sorted_events = [e for e in sorted_events if e.event_id <= up_to_event_id]
+    if up_to_seq is not None:
+        sorted_events = [
+            e for e in sorted_events if e.seq is not None and e.seq <= up_to_seq
+        ]
 
     checkins_by_student: dict[str, list[CheckinRecord]] = {}
     checkin_index: dict[str, CheckinRecord] = {}
@@ -158,6 +172,7 @@ def replay(
                     student_id=event.student_id,
                     seconds=seconds,
                     reason=str(event.payload.get("reason", "")),
+                    seq=event.seq,
                 )
             )
 
@@ -207,8 +222,15 @@ def replay(
             pending_lesson_units=pending_seconds // (45 * 60),
             meets_requirement=total_seconds >= required_seconds,
             daily=daily,
-            checkins=sorted(records, key=lambda r: r.start_utc),
-            adjustments=sorted(adjustments, key=lambda a: a.event_id),
+            checkins=sorted(
+                records,
+                key=lambda r: (
+                    r.start_utc,
+                    r.seq if r.seq is not None else 1 << 30,
+                    r.event_id,
+                ),
+            ),
+            adjustments=sorted(adjustments, key=lambda a: (a.seq is None, a.seq or 0, a.event_id)),
         )
 
     return ReplayState(

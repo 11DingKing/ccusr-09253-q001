@@ -214,8 +214,95 @@ def test_concurrent_freeze_only_one_wins(client):
     assert stored["students"][0]["total_seconds"] == 7200
 
 
+def _correction(eid, student, seconds, reason=""):
+    return {
+        "event_id": eid,
+        "event_type": "leave_correction",
+        "student_id": student,
+        "payload": {"adjustment_seconds": seconds, "reason": reason},
+    }
+
+
+def test_concurrent_imports_cannot_change_issued_freeze(db, client):
+    """并发导入与冻结交错时，已签发结果必须与截止序位重放一致。"""
+    from app.core.snapshot import build_snapshot
+    from app import services
+    from app.repository import load_events_up_to_seq
+    from tests.conftest import TestSessionLocal
+
+    _create_plan(client)
+    pv = SHANGHAI_PLAN["plan_version"]
+    # 初始事件，保证冻结非空。
+    client.post(
+        f"/api/plans/{pv}/events",
+        json={"events": [_checkin("BASE-1", "S1",
+                                  "2024-03-15T08:00:00+08:00",
+                                  "2024-03-15T10:00:00+08:00")]},
+    )
+
+    barrier = threading.Barrier(5)
+    issued: list[tuple[int, int]] = []  # (cutoff_seq, total_seconds)
+    lock = threading.Lock()
+
+    def _import_worker(idx: int):
+        session = TestSessionLocal()
+        barrier.wait()
+        try:
+            services.import_events(
+                session,
+                plan_version=pv,
+                events=[_correction(f"LATE-{idx}", "S1", 60, f"c{idx}")],
+            )
+        finally:
+            session.close()
+
+    def _freeze_worker(idx: int):
+        session = TestSessionLocal()
+        barrier.wait()
+        try:
+            snap, _created = services.freeze_semester(
+                session, plan_version=pv, freeze_id=f"F-RACE-{idx}"
+            )
+            with lock:
+                issued.append((snap.event_cutoff_seq,
+                               snap.students[0]["total_seconds"]))
+        finally:
+            session.close()
+
+    workers = [threading.Thread(target=_import_worker, args=(i,)) for i in range(2)]
+    workers += [threading.Thread(target=_freeze_worker, args=(i,)) for i in range(3)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+
+    plan = services.get_plan_plain(db, pv)
+    for cutoff_seq, total in issued:
+        assert cutoff_seq is not None
+        events = load_events_up_to_seq(db, pv, cutoff_seq)
+        rebuilt = build_snapshot(
+            events,
+            plan_version=pv,
+            timezone_name=plan["iana_timezone"],
+            required_seconds=plan["required_seconds"],
+            event_cutoff_seq=cutoff_seq,
+        )
+        assert rebuilt.students[0]["total_seconds"] == total
+
+    # 每个冻结各自只签发一次；重复返回相同结果。
+    for i in range(3):
+        snap, created = services.freeze_semester(
+            db, plan_version=pv, freeze_id=f"F-RACE-{i}"
+        )
+        assert created is False
+        assert any(
+            seq == snap.event_cutoff_seq and total == snap.students[0]["total_seconds"]
+            for seq, total in issued
+        )
+
+
 def test_new_york_dst_fallback_via_api(client):
-    """执行确定性的业务处理。"""
+    """纽约 DST 回拨夜按真实经过时长计学时。"""
     plan = dict(NY_PLAN)
     plan["required_seconds"] = 7200
     client.post("/api/plans", json=plan)
